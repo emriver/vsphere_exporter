@@ -3,6 +3,8 @@ package main
 import (
 	"sync"
 
+	"github.com/vmware/govmomi/find"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/vmware/govmomi/units"
@@ -21,7 +23,7 @@ type hostMetricGetter func(mo.HostSystem) float64
 type hostLabelGetter func(mo.HostSystem) string
 
 //Labels associated with the datastore objects
-var hostLabelNames = []string{"host"}
+var hostLabelNames = []string{"host", "datacenter", "cluster"}
 
 //Array of anonymous functions to retrieve label values
 var hostLabelValues = []hostLabelGetter{hostLabelGetterFuncRegistry["getHostName"]}
@@ -69,24 +71,42 @@ func newVsphereHostMetric(name string, description string, labels []string, metr
 	}
 }
 
-func collectHostMetrics(wg *sync.WaitGroup, e *Exporter, ch chan<- prometheus.Metric) {
+func collectHostMetrics(wg *sync.WaitGroup, e *Exporter, f *find.Finder, datacenterName string, ch chan<- prometheus.Metric) {
 	defer wg.Done()
 
-	var hs []mo.HostSystem
-	err := e.hostView.Retrieve(e.context, []string{vmwareHostObjectName}, []string{"summary"}, &hs)
+	clusters, err := f.ClusterComputeResourceList(e.context, "*")
 	if err != nil {
-		log.Infoln("Could not retrieve hosts data, vCenter may not be available")
-		e.vcenterAvailable = 0
-	} else {
-		e.vcenterAvailable = 1
-		for _, h := range hs {
+		log.Infoln("Could not retrieve clusters list: %s", err)
+		return
+	}
+	for _, c := range clusters {
+		hs, err := c.Hosts(e.context)
+		if err != nil {
+			log.Infoln("Could not retrieve host list: %s", err)
+			return
+		}
+		if err != nil {
+			log.Infoln("Could not retrieve hosts data, vCenter may not be available")
+			e.vcenterAvailable = 0
+		}
+		for _, host := range hs {
+			var h mo.HostSystem
+			err := host.Properties(e.context, host.Reference(), []string{"summary"}, &h)
+			if err != nil {
+				log.Infoln("Could not retrieve host properties: %s", err)
+			}
 			for _, metric := range hostMetrics {
 				var labelValues []string
 				for _, labelGetter := range metric.labelsGetter {
+
 					labelValues = append(labelValues, labelGetter(h))
 				}
+				labelValues = append(labelValues, datacenterName)
+				labelValues = append(labelValues, c.Name())
 				ch <- prometheus.MustNewConstMetric(metric.desc, prometheus.GaugeValue, metric.metricGetter(h), labelValues...)
 			}
 		}
+
 	}
+
 }

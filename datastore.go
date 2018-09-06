@@ -21,7 +21,7 @@ type datastoreMetricGetter func(mo.Datastore) float64
 type datastoreLabelGetter func(mo.Datastore) string
 
 //Labels associated with the datastore objects
-var datastoreLabelNames = []string{"name"}
+var datastoreLabelNames = []string{"name", "datacenter"}
 
 //Array of anonymous functions to retrieve label values
 var datastoreLabelValues = []datastoreLabelGetter{datastoreLabelGetterFuncRegistry["getDatastoreName"]}
@@ -51,7 +51,7 @@ func newVsphereDatastoreMetric(name string, description string, labels []string,
 	}
 }
 
-func collectDatastoreMetrics(wg *sync.WaitGroup, e *Exporter, ch chan<- prometheus.Metric) {
+func collectDatastoreMetrics(wg *sync.WaitGroup, e *Exporter, datacenterName string, ch chan<- prometheus.Metric) {
 	defer wg.Done()
 
 	var ds []mo.Datastore
@@ -59,16 +59,16 @@ func collectDatastoreMetrics(wg *sync.WaitGroup, e *Exporter, ch chan<- promethe
 	if err != nil {
 		log.Infoln("Could not retrieve datastores data, vCenter may not be available")
 		e.vcenterAvailable = 0
-	} else {
-		e.vcenterAvailable = 1
-		for _, d := range ds {
-			for _, metric := range datastoreMetrics {
-				var labelValues []string
-				for _, labelGetter := range metric.labelsGetter {
-					labelValues = append(labelValues, labelGetter(d))
-				}
-				ch <- prometheus.MustNewConstMetric(metric.desc, prometheus.GaugeValue, metric.metricGetter(d), labelValues...)
+	}
+	for _, d := range ds {
+		for _, metric := range datastoreMetrics {
+			var labelValues []string
+			for _, labelGetter := range metric.labelsGetter {
+				labelValues = append(labelValues, labelGetter(d))
 			}
+			labelValues = append(labelValues, datacenterName)
+			ch <- prometheus.MustNewConstMetric(metric.desc, prometheus.GaugeValue, metric.metricGetter(d), labelValues...)
 		}
+
 	}
 }

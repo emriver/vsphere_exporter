@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/view"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
@@ -92,12 +93,25 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.up
+	f := find.NewFinder(e.client.Client, true)
+	datacenters, err := f.DatacenterList(e.context, "*")
+	if err != nil {
+		log.Infoln("Could not retrieve Datacenters list : %s", err)
+		e.vcenterAvailable = 0
+		return
+	}
+	e.vcenterAvailable = 1
 	var wg sync.WaitGroup
-	wg.Add(2)
-	//Host data retrieval
-	go collectHostMetrics(&wg, e, ch)
-	//Datastore data retrieval
-	go collectDatastoreMetrics(&wg, e, ch)
+	//We need to wait the metrics for 2 objects (datastore+hosts) per datacenter
+	wg.Add(2 * len(datacenters))
+	for _, dc := range datacenters {
+		f.SetDatacenter(dc)
+		//Host data retrieval
+		go collectHostMetrics(&wg, e, f, dc.Name(), ch)
+		//Datastore data retrieval
+		go collectDatastoreMetrics(&wg, e, dc.Name(), ch)
+
+	}
 	wg.Wait()
 
 	vcenterAvailableDesc := prometheus.NewDesc("vcenter_available", "Set to 1 if the vcenter is available", []string{}, nil)
