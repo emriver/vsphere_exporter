@@ -3,12 +3,15 @@ package main
 import (
 	"sync"
 
-	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/units"
 	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/types"
 )
 
 type vsphereHostMetrics []*vsphereHostMetric
@@ -23,7 +26,7 @@ type hostMetricGetter func(mo.HostSystem) float64
 type hostLabelGetter func(mo.HostSystem) string
 
 //Labels associated with the datastore objects
-var hostLabelNames = []string{"host", "datacenter", "cluster"}
+var hostLabelNames = []string{"name", "datacenter", "cluster"}
 
 //Array of anonymous functions to retrieve label values
 var hostLabelValues = []hostLabelGetter{hostLabelGetterFuncRegistry["getHostName"]}
@@ -73,28 +76,45 @@ func newVsphereHostMetric(name string, description string, labels []string, metr
 
 func collectHostMetrics(wg *sync.WaitGroup, e *Exporter, f *find.Finder, datacenterName string, ch chan<- prometheus.Metric) {
 	defer wg.Done()
-
+	hostsRefList = make(map[string]string)
+	//Retrieves the cluster list
 	clusters, err := f.ClusterComputeResourceList(e.context, "*")
 	if err != nil {
 		log.Infoln("Could not retrieve clusters list: %s", err)
 		return
 	}
-	for _, c := range clusters {
-		hs, err := c.Hosts(e.context)
-		if err != nil {
-			log.Infoln("Could not retrieve host list: %s", err)
-			return
+	//TODO hosts outside a cluster are not handled
+	//Retrieves the host list for each cluster
+	var wgClusters sync.WaitGroup
+	wgClusters.Add(len(clusters))
+	for _, cluster := range clusters {
+		go collectHostMetricFromCluster(&wgClusters, e, datacenterName, cluster, ch)
+	}
+	wgClusters.Wait()
+}
+
+func collectHostMetricFromCluster(wg *sync.WaitGroup, e *Exporter, datacenterName string, cluster *object.ClusterComputeResource, ch chan<- prometheus.Metric) {
+	defer wg.Done()
+	hosts, err := cluster.Hosts(e.context)
+	if err != nil {
+		log.Infoln("Could not retrieve host list: %s", err)
+		return
+	}
+	if len(hosts) > 0 {
+		//Gets host properties for each host reference
+		var refs []types.ManagedObjectReference
+		for _, host := range hosts {
+			refs = append(refs, host.Reference())
+			hostsRefList[host.Reference().String()] = host.Name()
 		}
+		pc := property.DefaultCollector(e.client.Client)
+		var hs []mo.HostSystem
+		err = pc.Retrieve(e.context, refs, []string{"summary"}, &hs)
 		if err != nil {
-			log.Infoln("Could not retrieve hosts data, vCenter may not be available")
-			e.vcenterAvailable = 0
+			log.Infoln("Could not retrive hosts properties: ", err)
 		}
-		for _, host := range hs {
-			var h mo.HostSystem
-			err := host.Properties(e.context, host.Reference(), []string{"summary"}, &h)
-			if err != nil {
-				log.Infoln("Could not retrieve host properties: %s", err)
-			}
+		//Push all metrics for each
+		for _, h := range hs {
 			for _, metric := range hostMetrics {
 				var labelValues []string
 				for _, labelGetter := range metric.labelsGetter {
@@ -102,11 +122,9 @@ func collectHostMetrics(wg *sync.WaitGroup, e *Exporter, f *find.Finder, datacen
 					labelValues = append(labelValues, labelGetter(h))
 				}
 				labelValues = append(labelValues, datacenterName)
-				labelValues = append(labelValues, c.Name())
+				labelValues = append(labelValues, cluster.Name())
 				ch <- prometheus.MustNewConstMetric(metric.desc, prometheus.GaugeValue, metric.metricGetter(h), labelValues...)
 			}
 		}
-
 	}
-
 }

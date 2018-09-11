@@ -12,7 +12,6 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
-	"github.com/vmware/govmomi/view"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -22,9 +21,12 @@ const (
 	vmwareHostObjectName      = "HostSystem"
 	esxiMetricPrefix          = "esxi_"
 	datastoreMetricPrefix     = "datastore_"
+	vmMetricPrefix            = "vm_"
 )
 
 var (
+	datastoresRefList map[string]string
+	hostsRefList      map[string]string
 
 	//Defines all collected metrics for ESXI HostSystem
 	hostMetrics = vsphereHostMetrics{
@@ -43,13 +45,15 @@ var (
 		newVsphereDatastoreMetric(datastoreMetricPrefix+"free_space_bytes", "Datastore free space", datastoreLabelNames, datastoreMetricGetterFuncRegistry["getFreeSpace"], datastoreLabelValues),
 		newVsphereDatastoreMetric(datastoreMetricPrefix+"accessibility", "Datastore connectivity status", datastoreLabelNames, datastoreMetricGetterFuncRegistry["getAccessibility"], datastoreLabelValues),
 	}
+
+	vmMetrics = vsphereVmMetrics{
+		newVsphereVmMetric(vmMetricPrefix+"memory_size_bytes", "Virtual machine memory size", vmLabelNames, vmMetricGetterFuncRegistry["getMemorySize"], vmLabelValues),
+	}
 )
 
 type Exporter struct {
 	context          context.Context
 	client           govmomi.Client
-	hostView         view.ContainerView
-	datastoreView    view.ContainerView
 	up               prometheus.Gauge
 	vcenterAvailable float64
 }
@@ -63,21 +67,10 @@ func NewExporter(vcenterUrl string, username string, password string, insecure b
 		log.Fatal(err)
 	}
 	log.Infoln("Connected to vCenter")
-	manager := view.NewManager(c.Client)
-	datastoreContainerView, err := manager.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{vmwareDatastoreObjectName}, true)
-	if err != nil {
-		log.Fatal(err)
-	}
-	hostContainerView, err := manager.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{vmwareHostObjectName}, true)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	return &Exporter{
-		context:       ctx,
-		client:        *c,
-		hostView:      *hostContainerView,
-		datastoreView: *datastoreContainerView,
+		context: ctx,
+		client:  *c,
 		up: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "up",
@@ -101,16 +94,18 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	e.vcenterAvailable = 1
+
 	var wg sync.WaitGroup
 	//We need to wait the metrics for 2 objects (datastore+hosts) per datacenter
-	wg.Add(2 * len(datacenters))
+	wg.Add(3 * len(datacenters))
 	for _, dc := range datacenters {
 		f.SetDatacenter(dc)
 		//Host data retrieval
 		go collectHostMetrics(&wg, e, f, dc.Name(), ch)
 		//Datastore data retrieval
-		go collectDatastoreMetrics(&wg, e, dc.Name(), ch)
-
+		go collectDatastoreMetrics(&wg, e, f, dc.Name(), ch)
+		//Virtual machine data retrieval
+		go collectVmMetrics(&wg, e, f, dc.Name(), ch)
 	}
 	wg.Wait()
 
@@ -126,6 +121,7 @@ func main() {
 		username      = kingpin.Flag("username", "Username to connect the vCenter.").String()
 		password      = kingpin.Flag("password", "Password to connect the vCenter").String()
 		insecure      = kingpin.Flag("insecure", "Flag that enables SSL certificate verification.").Default("true").Bool()
+		//TODO add var for granular  collection option (host, datastore, vm)
 	)
 
 	kingpin.Version(version.Print("vsphere_exporter"))

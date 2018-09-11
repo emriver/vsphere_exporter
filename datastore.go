@@ -3,10 +3,14 @@ package main
 import (
 	"sync"
 
+	"github.com/vmware/govmomi/property"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/units"
 	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/types"
 )
 
 type vsphereDatastoreMetrics []*vsphereDatastoreMetric
@@ -51,24 +55,37 @@ func newVsphereDatastoreMetric(name string, description string, labels []string,
 	}
 }
 
-func collectDatastoreMetrics(wg *sync.WaitGroup, e *Exporter, datacenterName string, ch chan<- prometheus.Metric) {
+func collectDatastoreMetrics(wg *sync.WaitGroup, e *Exporter, f *find.Finder, datacenterName string, ch chan<- prometheus.Metric) {
 	defer wg.Done()
-
-	var ds []mo.Datastore
-	err := e.datastoreView.Retrieve(e.context, []string{vmwareDatastoreObjectName}, []string{"summary"}, &ds)
+	datastoresRefList = make(map[string]string)
+	datastores, err := f.DatastoreList(e.context, "*")
 	if err != nil {
-		log.Infoln("Could not retrieve datastores data, vCenter may not be available")
-		e.vcenterAvailable = 0
+		log.Infoln("Could not retrieve datastore list: %s", err)
+		return
 	}
-	for _, d := range ds {
-		for _, metric := range datastoreMetrics {
-			var labelValues []string
-			for _, labelGetter := range metric.labelsGetter {
-				labelValues = append(labelValues, labelGetter(d))
-			}
-			labelValues = append(labelValues, datacenterName)
-			ch <- prometheus.MustNewConstMetric(metric.desc, prometheus.GaugeValue, metric.metricGetter(d), labelValues...)
+	if len(datastores) > 0 {
+		pc := property.DefaultCollector(e.client.Client)
+		var refs []types.ManagedObjectReference
+		for _, datastore := range datastores {
+			refs = append(refs, datastore.Reference())
+			datastoresRefList[datastore.Reference().String()] = datastore.Name()
 		}
 
+		var ds []mo.Datastore
+		err = pc.Retrieve(e.context, refs, []string{"summary"}, &ds)
+		if err != nil {
+			log.Infoln("Could not retrieve datastore properties: ", err)
+			return
+		}
+		for _, d := range ds {
+			for _, metric := range datastoreMetrics {
+				var labelValues []string
+				for _, labelGetter := range metric.labelsGetter {
+					labelValues = append(labelValues, labelGetter(d))
+				}
+				labelValues = append(labelValues, datacenterName)
+				ch <- prometheus.MustNewConstMetric(metric.desc, prometheus.GaugeValue, metric.metricGetter(d), labelValues...)
+			}
+		}
 	}
 }
